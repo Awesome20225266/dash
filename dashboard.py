@@ -36,10 +36,28 @@ def _load_one_file(path: Path) -> pd.DataFrame | None:
         else:
             return None
 
-        # 1. Convert timestamp to datetime
-        df["STARTDATE"] = pd.to_datetime(df["STARTDATE"], dayfirst=True)
+        # Strip whitespace from column names
+        df.columns = df.columns.str.strip()
         
-        # 2. FIX: Distribute samples within the same minute
+        # Validate required columns
+        required = ["STARTDATE", "HZ", "VPM"]
+        missing = [c for c in required if c not in df.columns]
+        if missing:
+            print(f"Skipping {path.name}: missing columns {missing}")
+            return None
+
+        # 1. Convert timestamp to datetime
+        df["STARTDATE"] = pd.to_datetime(df["STARTDATE"], errors="coerce", dayfirst=True)
+        df = df.dropna(subset=["STARTDATE"]).copy()
+        if df.empty:
+            print(f"Skipping {path.name}: no valid STARTDATE values")
+            return None
+
+        # 2. Coerce numeric columns
+        df["HZ"] = pd.to_numeric(df["HZ"], errors="coerce")
+        df["VPM"] = pd.to_numeric(df["VPM"], errors="coerce")
+        
+        # 3. FIX: Distribute samples within the same minute
         # Spreads high-frequency (20Hz) samples evenly across the 60 seconds of each minute.
         df['sample_idx'] = df.groupby('STARTDATE').cumcount()
         df['samples_in_min'] = df.groupby('STARTDATE')['STARTDATE'].transform('count')
@@ -48,15 +66,16 @@ def _load_one_file(path: Path) -> pd.DataFrame | None:
             (df['sample_idx'] / df['samples_in_min']) * 60, unit='s'
         )
 
-        # 3. Data Cleaning
-        df["HZ"] = df["HZ"].interpolate()
-        df["SOURCE_FILE"] = path.name
+        # 4. Data Cleaning - Handle missing values in HZ using linear interpolation
+        df["HZ"] = df["HZ"].interpolate(method="linear", limit_direction="both")
+        df["SOURCE_FILE"] = path.stem
         
         return df.drop(columns=['sample_idx', 'samples_in_min'])
     except Exception as e:
-        st.error(f"Error loading {path.name}: {e}")
+        print(f"Skipping {path.name}: {e}")
         return None
 
+@st.cache_data(show_spinner=False)
 def load_all_data() -> pd.DataFrame:
     files = _discover_files()
     if not files:
@@ -65,7 +84,7 @@ def load_all_data() -> pd.DataFrame:
     loaded = []
     for f in files:
         df_tmp = _load_one_file(f)
-        if df_tmp is not None:
+        if df_tmp is not None and not df_tmp.empty:
             loaded.append(df_tmp)
     
     return pd.concat(loaded, ignore_index=True) if loaded else pd.DataFrame()
@@ -113,14 +132,27 @@ def create_oscillation_plot(df: pd.DataFrame):
         template="plotly_dark",
         hovermode="x unified",
         showlegend=False,
-        xaxis2_title="Timestamp (Precise Resolution)",
-        xaxis2_rangeslider_visible=True,
         margin=dict(l=50, r=50, t=100, b=50)
     )
     
     # Update y-axis titles
-    fig.update_yaxes(title_text="Hz", row=1, col=1)
-    fig.update_yaxes(title_text="VPM Value", row=2, col=1)
+    fig.update_yaxes(title_text="Frequency (HZ)", row=1, col=1)
+    fig.update_yaxes(title_text="VPM", row=2, col=1)
+    fig.update_xaxes(title_text="Time", row=2, col=1)
+    
+    # Add range selector buttons and range slider on bottom x-axis
+    fig.update_xaxes(
+        rangeselector=dict(
+            buttons=list([
+                dict(count=1, label="1 min", step="minute", stepmode="backward"),
+                dict(count=5, label="5 min", step="minute", stepmode="backward"),
+                dict(step="all", label="All")
+            ])
+        ),
+        rangeslider=dict(visible=True),
+        row=2,
+        col=1
+    )
     
     return fig
 
